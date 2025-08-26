@@ -1,393 +1,234 @@
 import streamlit as st
 import pandas as pd
-import folium
-from folium.plugins import MarkerCluster
-from streamlit_folium import st_folium
 import numpy as np
+import folium
+from folium.plugins import MarkerCluster, FastMarkerCluster
+from streamlit_folium import st_folium
 
-# Set page configuration
-st.set_page_config(
-    page_title="Geospatial Location Visualizer",
-    page_icon="🌍",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS for better styling
+# ---------------- Page config & style ----------------
+st.set_page_config(page_title="Geospatial Location Visualizer", page_icon="🌍", layout="wide")
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 1rem;
-    }
-    .map-container {
-        border: 2px solid #e6e6e6;
-        border-radius: 10px;
-        padding: 10px;
-        margin: 1rem 0;
-    }
-    .info-box {
-        background-color: #f8f9fa;
-        padding: 1rem;
-        border-radius: 8px;
-        margin: 0.5rem 0;
-        border-left: 4px solid #1f77b4;
-    }
-    .sidebar .sidebar-content {
-        background-color: #f8f9fa;
-    }
-    .location-popup {
-        font-family: Arial, sans-serif;
-        font-size: 14px;
-    }
+.main-header{font-size:2.0rem;color:#1f77b4;text-align:center;margin:.25rem 0 .75rem;}
+.cluster-popup{font-family:Arial, sans-serif;font-size:12px;line-height:1.25;padding:5px;max-width:320px;}
+.block-container{padding-top: 0.8rem;}
 </style>
 """, unsafe_allow_html=True)
 
+# ---------------- Helpers ----------------
 def validate_coordinates(lat, lon):
-    """Validate latitude and longitude values"""
     try:
-        lat = float(lat)
-        lon = float(lon)
-        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-            return False
-        return True
-    except (ValueError, TypeError):
+        lat = float(lat); lon = float(lon)
+        return (-90 <= lat <= 90) and (-180 <= lon <= 180)
+    except Exception:
         return False
 
-def create_folium_map(data, cluster=True, map_style='OpenStreetMap'):
-    """Create a Folium map with location details and optional clustering"""
-    if len(data) == 0:
-        return folium.Map(location=[20, 0], zoom_start=2, tiles=map_style)
-    
-    # Calculate center of the locations
-    center_lat = data['latitude'].mean()
-    center_lon = data['longitude'].mean()
-    
-    # Create base map
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=10 if len(data) < 100 else 8,
-        tiles=map_style,
-        control_scale=True
+@st.cache_data(show_spinner=False)
+def parse_csv(file):
+    """Read a CSV and return (valid_df, valid_count, invalid_count, postal_col, name_col, lat_col, lon_col)."""
+    df = pd.read_csv(file)
+
+    # Detect lat/lon columns
+    lat_col = lon_col = None
+    for c in df.columns:
+        lc = c.lower()
+        if lat_col is None and any(t in lc for t in ["lat","latitude"]): lat_col = c
+        if lon_col is None and any(t in lc for t in ["lon","long","longitude","lng"]): lon_col = c
+    if lat_col is None or lon_col is None:
+        nums = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(nums) >= 2:
+            lat_col, lon_col = nums[:2]
+        else:
+            # no usable coords
+            return pd.DataFrame(), 0, len(df), None, None, None, None
+
+    # Coerce & validate
+    tmp = df.copy()
+    tmp["__lat"] = pd.to_numeric(tmp[lat_col], errors="coerce")
+    tmp["__lon"] = pd.to_numeric(tmp[lon_col], errors="coerce")
+    mask = (
+        tmp["__lat"].notna() & tmp["__lon"].notna()
+        & tmp["__lat"].between(-90, 90) & tmp["__lon"].between(-180, 180)
     )
-    
-    if cluster and len(data) > 1:
-        # Create marker cluster for multiple locations
-        marker_cluster = MarkerCluster(
-            name="Clustered Locations",
-            overlay=True,
-            control=True,
-            icon_create_function=None
-        ).add_to(m)
-        
-        # Add markers to cluster with location details
-        for idx, row in data.iterrows():
-            # Build popup text with available location details
-            popup_lines = [f"<div class='location-popup'>"]
-            popup_lines.append(f"<b>📍 Location {idx + 1}</b><br>")
-            popup_lines.append(f"<b>Latitude:</b> {row['latitude']:.6f}<br>")
-            popup_lines.append(f"<b>Longitude:</b> {row['longitude']:.6f}<br>")
-            
-            # Add postal code if available
-            if 'postal_code' in row and pd.notna(row['postal_code']):
-                popup_lines.append(f"<b>Postal Code:</b> {row['postal_code']}<br>")
-            
-            # Add state if available
-            if 'state' in row and pd.notna(row['state']):
-                popup_lines.append(f"<b>State:</b> {row['state']}<br>")
-            
-            # Add city if available
-            if 'city' in row and pd.notna(row['city']):
-                popup_lines.append(f"<b>City:</b> {row['city']}<br>")
-            
-            # Add address if available
-            if 'address' in row and pd.notna(row['address']):
-                popup_lines.append(f"<b>Address:</b> {row['address']}<br>")
-            
-            popup_lines.append("</div>")
-            popup_text = "".join(popup_lines)
-            
-            # Create tooltip with basic info
-            tooltip_text = f"Location {idx + 1}"
-            if 'city' in row and pd.notna(row['city']):
-                tooltip_text = f"{row['city']}"
-            elif 'state' in row and pd.notna(row['state']):
-                tooltip_text = f"{row['state']}"
-            
-            folium.Marker(
-                location=[row['latitude'], row['longitude']],
-                popup=folium.Popup(popup_text, max_width=300),
-                tooltip=tooltip_text,
-                icon=folium.Icon(color='blue', icon='map-marker', prefix='fa')
-            ).add_to(marker_cluster)
-    else:
-        # Add individual markers without clustering
-        for idx, row in data.iterrows():
-            popup_lines = [f"<div class='location-popup'>"]
-            popup_lines.append(f"<b>📍 Location {idx + 1}</b><br>")
-            popup_lines.append(f"<b>Latitude:</b> {row['latitude']:.6f}<br>")
-            popup_lines.append(f"<b>Longitude:</b> {row['longitude']:.6f}<br>")
-            
-            if 'postal_code' in row and pd.notna(row['postal_code']):
-                popup_lines.append(f"<b>Postal Code:</b> {row['postal_code']}<br>")
-            
-            if 'state' in row and pd.notna(row['state']):
-                popup_lines.append(f"<b>State:</b> {row['state']}<br>")
-            
-            if 'city' in row and pd.notna(row['city']):
-                popup_lines.append(f"<b>City:</b> {row['city']}<br>")
-            
-            popup_lines.append("</div>")
-            popup_text = "".join(popup_lines)
-            
-            tooltip_text = f"Location {idx + 1}"
-            if 'city' in row and pd.notna(row['city']):
-                tooltip_text = f"{row['city']}"
-            
-            folium.Marker(
-                location=[row['latitude'], row['longitude']],
-                popup=folium.Popup(popup_text, max_width=300),
-                tooltip=tooltip_text,
-                icon=folium.Icon(color='red', icon='map-marker', prefix='fa')
-            ).add_to(m)
-    
-    # Add plugins
-    folium.plugins.MeasureControl(position='bottomleft').add_to(m)
+    valid = tmp.loc[mask].copy()
+    valid.rename(columns={"__lat":"latitude","__lon":"longitude"}, inplace=True)
+    valid.drop(columns=["__lat","__lon"], inplace=True, errors="ignore")
+
+    # Detect postal & name columns
+    postal_candidates = [c for c in valid.columns if any(t in c.lower()
+                         for t in ["postal","zipcode","zip code","zip","post_code","pincode"])]
+    postal_col = postal_candidates[0] if postal_candidates else None
+    name_candidates = [c for c in valid.columns if c.lower() in ["name","title","label","location_name"]]
+    name_col = name_candidates[0] if name_candidates else None
+
+    return valid, int(mask.sum()), int(len(df) - mask.sum()), postal_col, name_col, lat_col, lon_col
+
+def popup_html(row, postal_col=None, name_col=None):
+    parts = ["<div class='cluster-popup'>", "<b>📍 Location Details</b><br>"]
+    if name_col and name_col in row and pd.notna(row[name_col]):
+        parts.append(f"<b>Name:</b> {row[name_col]}<br>")
+    parts.append(f"<b>Latitude:</b> {row['latitude']:.6f}<br>")
+    parts.append(f"<b>Longitude:</b> {row['longitude']:.6f}<br>")
+    if postal_col and postal_col in row and pd.notna(row[postal_col]):
+        parts.append(f"<b>Postal Code:</b> {row[postal_col]}<br>")
+    if "state" in row and pd.notna(row["state"]):   parts.append(f"<b>State:</b> {row['state']}<br>")
+    if "city"  in row and pd.notna(row["city"]):    parts.append(f"<b>City:</b> {row['city']}<br>")
+    if "address" in row and pd.notna(row["address"]): parts.append(f"<b>Address:</b> {row['address']}<br>")
+    parts.append("</div>")
+    return "".join(parts)
+
+def tooltip_text(row, postal_col=None, name_col=None, idx=0):
+    """
+    Always show Lat/Lon and Postal Code (if available) on hover.
+    Name (if present) is prefixed on the first line.
+    """
+    name_part = ""
+    if name_col and name_col in row and pd.notna(row[name_col]):
+        name_part = f"{row[name_col]}\n"
+    lat_val = row.get("latitude", None)
+    lon_val = row.get("longitude", None)
+    latlon_part = f"Lat: {float(lat_val):.6f}, Lon: {float(lon_val):.6f}" if lat_val is not None and lon_val is not None else "Lat/Lon: n/a"
+    postal_part = ""
+    if postal_col and postal_col in row and pd.notna(row[postal_col]):
+        postal_part = f"\nPostal: {row[postal_col]}"
+    return f"{name_part}{latlon_part}{postal_part}"
+
+def add_layer(df, color, layer_name, cluster=True, fast=False, postal_col=None, name_col=None):
+    """
+    When fast=True -> FastMarkerCluster (very fast, but no custom icon/popup on spiderfy and no tooltips).
+    When fast=False -> MarkerCluster with colored house icons + popups/tooltips.
+    """
+    layer = folium.FeatureGroup(name=layer_name, overlay=True, control=True)
+    if df.empty:
+        return layer
+
+    if cluster and fast:
+        pts = df[["latitude","longitude"]].to_numpy().tolist()
+        FastMarkerCluster(pts, name=f"{layer_name} Fast").add_to(layer)
+        return layer
+
+    # Normal cluster path (preserves icon colors and popups/tooltips)
+    cl = MarkerCluster(
+        name=f"{layer_name} Clusters", overlay=True, control=False,
+        options={'maxClusterRadius':50,'spiderfyOnMaxZoom':True,'showCoverageOnHover':True,'zoomToBoundsOnClick':True}
+    )
+    layer.add_child(cl)
+    for i, r in df.iterrows():
+        folium.Marker(
+            [r["latitude"], r["longitude"]],
+            tooltip=folium.Tooltip(tooltip_text(r, postal_col, name_col, i+1), sticky=True),
+            popup=folium.Popup(popup_html(r, postal_col, name_col), max_width=320),
+            icon=folium.Icon(color=color, icon="home", prefix="fa")  # colored house icon
+        ).add_to(cl)
+    return layer
+
+def build_map(csv1, csv2, cluster=True, fast_csv=False,
+              postal1=None, postal2=None, name1=None, name2=None):
+    if csv1.empty and csv2.empty:
+        return folium.Map(location=[20,0], zoom_start=2)
+    base = pd.concat(
+        [csv1[["latitude","longitude"]]] if not csv1.empty else [] +
+        [csv2[["latitude","longitude"]]] if not csv2.empty else [],
+        ignore_index=True
+    )
+    m = folium.Map(location=[base["latitude"].mean(), base["longitude"].mean()], zoom_start=9)
+
+    # URL Data = GREEN, Store Data = BLUE
+    add_layer(csv1, "green", "URL Data (Green)",  cluster, fast_csv, postal1, name1).add_to(m)
+    add_layer(csv2, "blue",  "Store Data (Blue)", cluster, fast_csv, postal2, name2).add_to(m)
+
     folium.plugins.Fullscreen(position='topright').add_to(m)
-    folium.plugins.LocateControl(position='topright').add_to(m)
-    folium.LayerControl().add_to(m)
-    
-    # Fit map bounds to show all locations
-    if len(data) > 0:
-        sw = data[['latitude', 'longitude']].min().values.tolist()
-        ne = data[['latitude', 'longitude']].max().values.tolist()
-        m.fit_bounds([sw, ne])
-    
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
+# ---------------- App ----------------
 def main():
-    # Main content header
-    st.markdown('<h1 class="main-header">🌍 Geospatial Location Visualizer</h1>', unsafe_allow_html=True)
-    
-    # Initialize session state
-    if 'valid_data' not in st.session_state:
-        st.session_state.valid_data = pd.DataFrame()
-    if 'map_style' not in st.session_state:
-        st.session_state.map_style = 'OpenStreetMap'
-    if 'cluster_enabled' not in st.session_state:
-        st.session_state.cluster_enabled = True
+    st.markdown('<h1 class="main-header">🌍 Location Visualizer — URL Data (Green) & Store Data (Blue)</h1>', unsafe_allow_html=True)
 
-    # SIDEBAR CONTROLS
     with st.sidebar:
-        st.header("📁 Data Upload & Configuration")
-        
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Upload CSV File with Location Data",
-            type=['csv'],
-            help="Upload CSV with latitude, longitude, and optional postal_code, state, city columns"
-        )
-        
-        if uploaded_file is not None:
-            try:
-                df = pd.read_csv(uploaded_file)
-                
-                st.success(f"✅ File uploaded! {len(df)} records found")
-                
-                # Detect coordinate columns
-                possible_lat_cols = [col for col in df.columns if any(term in col.lower() for term in ['lat', 'latitude'])]
-                possible_lon_cols = [col for col in df.columns if any(term in col.lower() for term in ['lon', 'long', 'longitude', 'lng'])]
-                
-                st.subheader("🎯 Coordinate Selection")
-                
-                # Latitude selection
-                if possible_lat_cols:
-                    lat_col = st.selectbox(
-                        "Latitude Column",
-                        options=df.columns,
-                        index=df.columns.get_loc(possible_lat_cols[0]),
-                        help="Select the column containing latitude values"
-                    )
-                else:
-                    lat_col = st.selectbox(
-                        "Latitude Column",
-                        options=df.columns,
-                        help="Select the column containing latitude values"
-                    )
-                
-                # Longitude selection
-                if possible_lon_cols:
-                    lon_col = st.selectbox(
-                        "Longitude Column",
-                        options=df.columns,
-                        index=df.columns.get_loc(possible_lon_cols[0]),
-                        help="Select the column containing longitude values"
-                    )
-                else:
-                    lon_col = st.selectbox(
-                        "Longitude Column",
-                        options=df.columns,
-                        help="Select the column containing longitude values"
-                    )
-                
-                # Validate data
-                valid_mask = df.apply(
-                    lambda row: validate_coordinates(row[lat_col], row[lon_col]), 
-                    axis=1
-                )
-                
-                valid_data = df[valid_mask].copy()
-                valid_data['latitude'] = pd.to_numeric(valid_data[lat_col], errors='coerce')
-                valid_data['longitude'] = pd.to_numeric(valid_data[lon_col], errors='coerce')
-                valid_data = valid_data.dropna(subset=['latitude', 'longitude'])
-                
-                st.session_state.valid_data = valid_data
-                
-                # Show validation results
-                st.markdown("---")
-                st.subheader("📊 Validation Results")
-                st.write(f"✅ **Valid locations:** {len(valid_data)}")
-                st.write(f"❌ **Invalid coordinates:** {len(df) - len(valid_data)}")
-                
-                # Show available location columns
-                location_cols = [col for col in valid_data.columns if col.lower() in ['postal_code', 'zip', 'state', 'city', 'address', 'location']]
-                if location_cols:
-                    st.write(f"📋 **Location data found:** {', '.join(location_cols)}")
-                
-            except Exception as e:
-                st.error(f"Error processing file: {str(e)}")
-        
-        else:
-            st.info("👆 Please upload a CSV file to begin")
-            st.markdown("---")
-            st.subheader("📋 Recommended Data Format")
-            st.write("""
-            Include these columns:
-            - **latitude** (required)
-            - **longitude** (required)
-            - **postal_code** (optional)
-            - **state** (optional)
-            - **city** (optional)
-            - **address** (optional)
-            """)
-        
-        # Map settings
-        st.markdown("---")
-        st.subheader("🗺️ Map Settings")
-        
-        st.session_state.cluster_enabled = st.checkbox(
-            "Cluster Locations", 
-            value=True,
-            help="Group nearby locations together"
-        )
-        
-        st.session_state.map_style = st.selectbox(
-            "Map Style",
-            options=['OpenStreetMap', 'CartoDB positron', 'Stamen Terrain', 'Stamen Toner'],
-            index=0
+        st.header("📁 Upload CSVs")
+        c1, c2 = st.columns(2)
+        with c1:
+            up1 = st.file_uploader("URL Data (CSV)", type=["csv"], key="csv1")
+        with c2:
+            up2 = st.file_uploader("Store Data (CSV)", type=["csv"], key="csv2")
+
+        st.header("⚙️ Map Settings")
+        cluster = st.checkbox("Cluster locations", value=True)
+        fast_csv = st.checkbox(
+            "High-speed for large CSVs (FastMarkerCluster)",
+            value=False,
+            help="Much faster for big files. Disables custom icons/popups/tooltips on spiderfy."
         )
 
-    # MAIN CONTENT AREA
-    if not st.session_state.valid_data.empty:
-        # Display location statistics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("Locations Found", len(st.session_state.valid_data))
-        
-        with col2:
-            avg_lat = st.session_state.valid_data['latitude'].mean()
-            st.metric("Avg Latitude", f"{avg_lat:.6f}")
-        
-        with col3:
-            avg_lon = st.session_state.valid_data['longitude'].mean()
-            st.metric("Avg Longitude", f"{avg_lon:.6f}")
-        
-        with col4:
-            unique_states = st.session_state.valid_data['state'].nunique() if 'state' in st.session_state.valid_data else 0
-            st.metric("Unique States", unique_states if unique_states > 0 else "N/A")
-        
-        # Interactive Map
-        st.markdown("### 📍 Location Map")
-        st.markdown('<div class="map-container">', unsafe_allow_html=True)
-        
-        map_obj = create_folium_map(
-            st.session_state.valid_data, 
-            cluster=st.session_state.cluster_enabled,
-            map_style=st.session_state.map_style
+    # Parse CSVs
+    csv1, c1_ok, c1_bad, postal1, name1, _, _ = parse_csv(up1) if up1 else (pd.DataFrame(),0,0,None,None,None,None)
+    csv2, c2_ok, c2_bad, postal2, name2, _, _ = parse_csv(up2) if up2 else (pd.DataFrame(),0,0,None,None,None,None)
+
+    # Metrics
+    total = len(csv1) + len(csv2)
+    m1, m2, m3, m4 = st.columns(4)
+    with m1: st.metric("Total Locations", f"{total:,}")
+    with m2:
+        if total:
+            lat_all = pd.concat([s for s in [csv1.get("latitude"), csv2.get("latitude")] if s is not None], ignore_index=True)
+            st.metric("Avg Latitude", f"{lat_all.mean():.6f}")
+        else: st.metric("Avg Latitude", "—")
+    with m3:
+        if total:
+            lon_all = pd.concat([s for s in [csv1.get("longitude"), csv2.get("longitude")] if s is not None], ignore_index=True)
+            st.metric("Avg Longitude", f"{lon_all.mean():.6f}")
+        else: st.metric("Avg Longitude", "—")
+    with m4:
+        any_postal = postal1 or postal2
+        if any_postal:
+            series_list = []
+            if postal1 and postal1 in csv1.columns: series_list.append(csv1[postal1])
+            if postal2 and postal2 in csv2.columns: series_list.append(csv2[postal2])
+            if series_list:
+                st.metric("Unique Postal Codes", pd.concat(series_list, ignore_index=True).nunique(dropna=True))
+            else:
+                st.metric("Unique Postal Codes", "0")
+        else:
+            st.metric("Unique Postal Codes", "Not found")
+
+    # Map (full width)
+    st.markdown("### 📍 Map (Green = URL Data, Blue = Store Data)")
+    with st.spinner("Rendering map..."):
+        fmap = build_map(
+            csv1, csv2, cluster=cluster, fast_csv=fast_csv,
+            postal1=postal1, postal2=postal2, name1=name1, name2=name2
         )
-        
-        map_data = st_folium(
-            map_obj, 
-            width=None,
-            height=600,
-            returned_objects=[],
-            key="main_map"
-        )
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Location details tabs
-        tab1, tab2, tab3 = st.tabs(["📍 Location Data", "📊 Statistics", "🌐 Geographic Summary"])
-        
-        with tab1:
-            st.dataframe(st.session_state.valid_data.head(20), use_container_width=True)
-        
-        with tab2:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("**Latitude Distribution**")
-                st.bar_chart(st.session_state.valid_data['latitude'].value_counts().head(10))
-            with col2:
-                st.write("**Longitude Distribution**")
-                st.bar_chart(st.session_state.valid_data['longitude'].value_counts().head(10))
-        
-        with tab3:
-            if 'state' in st.session_state.valid_data:
-                st.write("**Locations by State**")
-                state_counts = st.session_state.valid_data['state'].value_counts()
-                st.dataframe(state_counts, use_container_width=True)
-            
-            if 'postal_code' in st.session_state.valid_data:
-                st.write("**Locations by Postal Code**")
-                postal_counts = st.session_state.valid_data['postal_code'].value_counts().head(10)
-                st.dataframe(postal_counts, use_container_width=True)
-    
+    st_folium(fmap, width=None, height=640, returned_objects=[])
+
+    # Postal Code summary (bar graph)
+    st.markdown("### 🧭 Postal Code Summary")
+    if postal1 or postal2:
+        series = []
+        if postal1 and postal1 in csv1.columns: series.append(csv1[postal1].dropna().astype(str))
+        if postal2 and postal2 in csv2.columns: series.append(csv2[postal2].dropna().astype(str))
+        if series:
+            combined = pd.concat(series, ignore_index=True)
+            counts = combined.value_counts().head(20)  # top 20
+            st.bar_chart(counts)
+        else:
+            st.info("No postal codes detected in the uploaded files.")
     else:
-        # Welcome screen
-        st.info("🌐 Welcome to Location Data Visualizer!")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("""
-            ### How to use:
-            1. **Upload** a CSV file with location data
-            2. **Select** coordinate columns
-            3. **View** locations on interactive map
-            4. **Explore** geographic patterns
-            
-            ### Enhanced Features:
-            - 📍 Location-based clustering
-            - 📮 Postal code and state display
-            - 🗺️ Professional map styling
-            - 📊 Geographic analytics
-            """)
-        
-        with col2:
-            st.write("### 📋 Ideal Data Structure")
-            sample_data = pd.DataFrame({
-                'location_id': [1, 2, 3, 4, 5],
-                'latitude': [40.7128, 34.0522, 41.8781, 39.9526, 29.7604],
-                'longitude': [-74.0060, -118.2437, -87.6298, -75.1652, -95.3698],
-                'postal_code': ['10001', '90001', '60601', '19102', '77001'],
-                'state': ['NY', 'CA', 'IL', 'PA', 'TX'],
-                'city': ['New York', 'Los Angeles', 'Chicago', 'Philadelphia', 'Houston'],
-                'address': ['123 Main St', '456 Oak Ave', '789 Pine Rd', '321 Elm St', '654 Maple Ave']
-            })
-            st.dataframe(sample_data, use_container_width=True)
+        st.info("No postal code column detected. Make sure your CSV has a column like 'postal', 'zip', 'zipcode', etc.")
+
+    # Data previews
+    with st.expander("📊 URL Data (valid rows)"):
+        if not csv1.empty:
+            st.write(f"✅ Valid: {c1_ok:,} | ❌ Invalid: {c1_bad:,}")
+            st.dataframe(csv1.head(25), use_container_width=True)
+        else:
+            st.info("No valid rows in URL Data.")
+    with st.expander("📊 Store Data (valid rows)"):
+        if not csv2.empty:
+            st.write(f"✅ Valid: {c2_ok:,} | ❌ Invalid: {c2_bad:,}")
+            st.dataframe(csv2.head(25), use_container_width=True)
+        else:
+            st.info("No valid rows in Store Data.")
 
 if __name__ == "__main__":
     main()
